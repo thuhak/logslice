@@ -1,3 +1,6 @@
+"""
+simple log parser like logstash
+"""
 import os
 import threading
 import logging
@@ -10,9 +13,12 @@ from weakref import WeakValueDictionary
 
 from .db import session_scope, Logfile, LogStat
 
-
 __version__ = '1.0.0'
 __author__ = 'thuhak.zhou@nio.com'
+
+
+def is_thread_running(thread: threading.Thread) -> bool:
+    return thread.is_alive() if thread is not None else False
 
 
 class LogParser:
@@ -22,6 +28,7 @@ class LogParser:
     _instances = WeakValueDictionary()
 
     def __new__(cls, filename, que, encoding='utf-8', flush_interval=3, stop_time=30):
+        """flyweight"""
         if filename in cls._instances:
             instance = cls._instances[filename]
             instance.que = que
@@ -29,7 +36,7 @@ class LogParser:
             instance.flush_interval = flush_interval
             instance.stop_time = stop_time
         else:
-            instance = super().__new__(cls, filename, que, encoding, flush_interval, stop_time)
+            instance = super().__new__(cls)
             cls._instances[filename] = instance
         return instance
 
@@ -67,46 +74,55 @@ class LogParser:
         self.running = False
         self.status = LogStat.ready
         self.context = None
-        self.working_thread = None
+        self._working_thread = None
+        self._flush_thread = None
         self._flag = threading.Event()
         self.start()
 
     def parser(self, line):
         """
-        default parser, you can define you own parser
+        default parser, you can define you own parser, override the default one
         """
         return line
 
     def start(self):
         """start parser"""
         logging.info('starting logfile parser')
-        self.working_thread = threading.Thread(target=self.run, daemon=True)
-        self.working_thread.start()
-        flush_thread = threading.Thread(target=self.flush, daemon=True)
-        flush_thread.start()
+        self._working_thread = threading.Thread(target=self.run, daemon=True)
+        self._working_thread.start()
+        self._flush_thread = threading.Thread(target=self.flush, daemon=True)
+        self._flush_thread.start()
 
     def stop(self):
         """stop parser"""
         logging.info('stopping logfile parser')
         self._flag.set()
+        while True:
+            if not is_thread_running(self._flush_thread) and not is_thread_running(self._working_thread):
+                self.running = False
+                break
+            sleep(0.1)
 
     def _flush(self):
         """
         flush running to database
         """
-        with session_scope() as sess:
-            self._data.pos = self.pos
-            self._data.inode = self.inode
-            self._data.last_update = datetime.now()
-            self._data.status = self.status
-            sess.merge(self._data)
+        try:
+            with session_scope() as sess:
+                self._data.pos = self.pos
+                self._data.inode = self.inode
+                self._data.last_update = datetime.now()
+                self._data.status = self.status
+                sess.merge(self._data)
+        except Exception as e:
+            logging.error('can not save parser status to database, reason {}'.format(str(e)))
 
     def flush(self):
         """
         run _flush job every self.flush_interval seconds
         """
         while True:
-            if self.working_thread and not self.working_thread.is_alive():
+            if not is_thread_running(self._working_thread):
                 self._flush()
                 self.running = False
                 break
@@ -166,7 +182,7 @@ class LogParser:
                             self.status = LogStat.read_file_error
                             raise e
                     elif self.last_update and \
-                            (self.last_update - datetime.fromtimestamp(mtime)).seconds >= self.stop_time:
+                            self.last_update.timestamp() - mtime >= self.stop_time:
                         logging.info('{} has no changing over {} seconds,stop parsing'.format(self.filename,
                                                                                               self.stop_time))
                         self.status = LogStat.no_update
@@ -177,6 +193,10 @@ class LogParser:
 
 
 class LogSlice:
+    """
+    log parser manager
+    """
+
     def __init__(self, path: list, output, parser=LogParser, file_filter=None, encoding='utf-8', recurse=True,
                  flush_interval=3, rescan_interval=10, close_file_time=30):
         """
@@ -202,6 +222,7 @@ class LogSlice:
 
         self.que = Queue()
         self.jobs = []
+        self._flag = threading.Event()
 
     def scan_logs(self) -> set:
         """
@@ -219,10 +240,35 @@ class LogSlice:
     def start(self):
         ...
 
+    def stop(self):
+        self._flag.set()
+        for job in self.jobs:
+            job.stop()
+
+    def clean_stopped_jobs(self):
+        self.jobs = [job for job in self.jobs if job.running]
+
     def scan(self):
+        while True:
+            if self._flag.is_set():
+                break
+            self._scan()
+            sleep(self.rescan_interval)
+
+    def _scan(self):
+        self.clean_stopped_jobs()
         logs = self.scan_logs()
-        new_logs = logs - {j.filename for j in self.jobs}
         no_update_logs = set()
         with session_scope() as sess:
-            check_logs = sess.query(Logfile).filter(status=LogStat.no_update)
-
+            check_logs = sess.query(Logfile).filter(Logfile.status == LogStat.no_update, Logfile.filename.in_(logs))
+            for log in check_logs:
+                try:
+                    mtime = os.stat(log.filename).st_mtime
+                    if mtime < log.last_update.timestamp():
+                        no_update_logs.add(log.filename)
+                except Exception as e:
+                    logging.error('read file {} error, reason {}'.format(log.filename, str(e)))
+                    continue
+        logs = logs - no_update_logs
+        self.jobs = [self.parser(filename=f, que=self.que, encoding=self.encoding, flush_interval=self.flush_interval,
+                                 stop_time=self.close_file_time) for f in logs]
