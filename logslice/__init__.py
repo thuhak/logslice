@@ -17,6 +17,8 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, Enum
 from sqlalchemy.ext.declarative import declarative_base
 
+from .outputs import *
+
 __version__ = '1.0.0'
 __author__ = 'thuhak.zhou@nio.com'
 Base = declarative_base()
@@ -65,14 +67,10 @@ class LogParser:
     """
     _instances = WeakValueDictionary()
 
-    def __new__(cls, filename, que, dbsession, encoding='utf-8', flush_interval=3, stop_time=30):
+    def __new__(cls, filename, *args, **kwargs):
         """flyweight"""
         if filename in cls._instances:
             instance = cls._instances[filename]
-            instance.que = que
-            instance.encoding = encoding
-            instance.flush_interval = flush_interval
-            instance.stop_time = stop_time
         else:
             instance = super().__new__(cls)
             cls._instances[filename] = instance
@@ -145,7 +143,7 @@ class LogParser:
 
     def _flush(self):
         """
-        flush running to database
+        flush status to database
         """
         try:
             with session_scope(self.dbsession) as sess:
@@ -237,8 +235,8 @@ class LogSlice:
     log parser manager
     """
 
-    def __init__(self, path: list, output, dbpath='/var/lib/logslice', parser=LogParser, file_filter=None,
-                 encoding='utf-8', recurse=True, flush_interval=3, rescan_interval=10, close_file_time=30,
+    def __init__(self, path, output, dbpath='/var/lib/logslice', parser=LogParser, file_filter=None,
+                 encoding='utf-8', flush_interval=3, rescan_interval=30, close_file_time=30,
                  cache_size=10):
         """
         :param path: search log files using globbing patterns
@@ -247,18 +245,19 @@ class LogSlice:
         :param parser: parser class
         :param file_filter: regex filter
         :param encoding: file encoding
-        :param recurse: recurse or not
         :param flush_interval: every flush_interval seconds, latest running will be saved to database
         :param rescan_interval: every rescan_interval seconds, rescan logs
         :param close_file_time: close file which not changed within close_file_time seconds
         :param cache_size: a iterable object for output
         """
-        self.path = path
+        if isinstance(path, str):
+            self.path = [path]
+        else:
+            self.path = path
         self.output_callback = output
         self.parser = parser
         self.filter = None if file_filter is None else re.compile(file_filter)
         self.encoding = encoding
-        self.recurse = recurse
         self.flush_interval = flush_interval
         self.rescan_interval = rescan_interval
         self.close_file_time = close_file_time
@@ -285,7 +284,7 @@ class LogSlice:
         """
         all_logs = set()
         for logpath in self.path:
-            logs = set(glob(logpath, recursive=self.recurse))
+            logs = set(glob(logpath, recursive=True))
             if self.filter:
                 logs = {x for x in logs if self.filter.match(x)}
             all_logs |= logs
@@ -368,8 +367,3 @@ class LogSlice:
         for log in logs:
             self.jobs.append(self.parser(filename=log, que=self.que, dbsession=self.dbsession, encoding=self.encoding,
                                          flush_interval=self.flush_interval, stop_time=self.close_file_time))
-
-
-def default_output(cache):
-    for l in cache:
-        print(l)
